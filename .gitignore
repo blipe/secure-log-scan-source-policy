@@ -1,0 +1,9 @@
+/target/
+/out/
+/secure-log-scan.jar
+*.class
+*.jar
+*.war
+.idea/
+.vscode/
+.DS_Store
