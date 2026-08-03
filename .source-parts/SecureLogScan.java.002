@@ -1,0 +1,200 @@
+        final Map<String, ClassNode> classes = new LinkedHashMap<>();
+        final Map<String, ClassOrigin> classOrigins = new LinkedHashMap<>();
+        final Map<String, ArtifactInfo> artifacts = new LinkedHashMap<>();
+        final List<NestedArchive> nestedArchives = new ArrayList<>();
+        final Set<DuplicateClass> duplicateClasses = new TreeSet<>();
+        final Map<MethodKey, MethodNode> methods = new LinkedHashMap<>();
+        final Set<MethodKey> deferredLambdaBodies = new LinkedHashSet<>();
+        final Set<FieldKey> annotatedSecureFields = new LinkedHashSet<>();
+        final Set<String> effectiveSecureAnnotationDescs = new LinkedHashSet<>();
+        final Map<MethodKey, FieldKey> secureMethodReturns = new LinkedHashMap<>();
+        final Map<MethodKey, Map<Integer, FieldKey>> secureParameters = new LinkedHashMap<>();
+        final Map<String, FieldKey> secureTypes = new LinkedHashMap<>();
+        final Set<FieldKey> taintedFields = new LinkedHashSet<>();
+        final Map<FieldKey, Set<Source>> fieldDirectSources = new LinkedHashMap<>();
+        final Map<FieldKey, Set<Source>> fieldRenderSources = new LinkedHashMap<>();
+        final Map<FieldKey, Set<Source>> fieldDeepRenderSources = new LinkedHashMap<>();
+        final Map<FieldKey, Set<Source>> fieldCompletionFailureSources = new LinkedHashMap<>();
+        final Map<FieldKey, Set<TypeRef>> fieldTypes = new LinkedHashMap<>();
+        final Map<FieldKey, Set<LambdaTemplate>> fieldLambdas = new LinkedHashMap<>();
+        final Map<Object, Set<FieldKey>> secureConstantFields = new LinkedHashMap<>();
+        final Map<MethodKey, MethodSummary> summaries = new LinkedHashMap<>();
+        final Map<MethodKey, SanitizerInfo> sanitizers = new LinkedHashMap<>();
+        final Map<MethodKey, SuppressionInfo> methodSuppressions = new LinkedHashMap<>();
+        final Map<String, SuppressionInfo> typeSuppressions = new LinkedHashMap<>();
+        final Set<String> baselineFingerprints = new LinkedHashSet<>();
+        final MethodModelRegistry methodModels = new MethodModelRegistry();
+        final Set<Finding> findings = new TreeSet<>();
+        boolean changed;
+        long analyzedWorkItems;
+
+        ScanModel(Config cfg) { this.cfg = cfg; }
+
+        void loadConfiguredInputs() {
+            int index = 0;
+            for (Path root : cfg.roots) loadSafely(root, ArtifactRole.APPLICATION, PRIORITY_APPLICATION - index++, true);
+            index = 0;
+            for (Path root : cfg.classpathRoots) loadSafely(root, ArtifactRole.DEPENDENCY, PRIORITY_EXPLICIT_DEPENDENCY - index++, false);
+            index = 0;
+            for (Path root : cfg.modulePathRoots) loadSafely(root, ArtifactRole.DEPENDENCY, PRIORITY_MODULE_PATH - index++, false);
+
+            int nestedIndex = 0;
+            while (nestedIndex < nestedArchives.size()) {
+                NestedArchive nested = nestedArchives.get(nestedIndex++);
+                try {
+                    loadJarBytes(nested.bytes, nested.source, ArtifactRole.DEPENDENCY,
+                            PRIORITY_NESTED_DEPENDENCY, false);
+                } catch (IOException | RuntimeException ex) {
+                    addFinding(Finding.incomplete("Unable to scan nested dependency " + nested.source + ": " + ex));
+                }
+            }
+
+            for (String module : new LinkedHashSet<>(cfg.jdkModules)) {
+                try { loadJdkModule(module); }
+                catch (IOException | RuntimeException ex) {
+                    addFinding(Finding.incomplete("Unable to scan JDK module " + module + " through jrt:/: " + ex));
+                }
+            }
+        }
+
+        void loadSafely(Path root, ArtifactRole role, int priority, boolean applicationRoot) {
+            try { load(root, role, priority, applicationRoot); }
+            catch (IOException | RuntimeException ex) {
+                addFinding(Finding.incomplete("Unable to scan input " + root + ": " + ex));
+            }
+        }
+
+        void load(Path root, ArtifactRole role, int priority, boolean applicationRoot) throws IOException {
+            if (!Files.exists(root)) throw new IOException("Missing path: " + root);
+            if (Files.isDirectory(root)) {
+                ArtifactInfo directoryArtifact = registerArtifact(new ArtifactInfo(
+                        root.getFileName() == null ? root.toString() : root.getFileName().toString(),
+                        root.toAbsolutePath().normalize().toString(), role, "", "", ""));
+                List<Path> files;
+                try (var stream = Files.walk(root)) {
+                    files = stream.filter(Files::isRegularFile).sorted().toList();
+                }
+                for (Path file : files) {
+                    String name = file.getFileName().toString();
+                    if (name.endsWith(".class")) {
+                        loadClassBytes(Files.readAllBytes(file), file.toString(), directoryArtifact, priority);
+                    } else if (name.endsWith(".jar")) {
+                        byte[] bytes = Files.readAllBytes(file);
+                        if (applicationRoot) {
+                            nestedArchives.add(new NestedArchive(bytes, file.toString(), directoryArtifact));
+                        } else {
+                            loadJarBytes(bytes, file.toString(), role, priority, false);
+                        }
+                    }
+                }
+            } else if (root.toString().endsWith(".jar") || root.toString().endsWith(".war")) {
+                loadJarBytes(Files.readAllBytes(root), root.toAbsolutePath().normalize().toString(), role, priority, applicationRoot);
+            } else if (root.toString().endsWith(".class")) {
+                ArtifactInfo artifact = registerArtifact(new ArtifactInfo(root.getFileName().toString(),
+                        root.toAbsolutePath().normalize().toString(), role, "", "", ""));
+                loadClassBytes(Files.readAllBytes(root), root.toString(), artifact, priority);
+            } else throw new IOException("Unsupported input path: " + root + " (expected class dir, .class, .jar, or .war) ");
+        }
+
+        void loadJarBytes(byte[] jarBytes, String source, ArtifactRole role, int priority, boolean applicationRoot) throws IOException {
+            Map<String, byte[]> entries = new LinkedHashMap<>();
+            Manifest manifest;
+            try (JarInputStream in = new JarInputStream(new ByteArrayInputStream(jarBytes))) {
+                manifest = in.getManifest();
+                JarEntry entry;
+                while ((entry = in.getNextJarEntry()) != null) {
+                    if (entry.isDirectory()) continue;
+                    entries.put(entry.getName(), in.readAllBytes());
+                }
+            }
+            if (manifest == null && entries.containsKey(JarFile.MANIFEST_NAME)) {
+                manifest = new Manifest(new ByteArrayInputStream(entries.get(JarFile.MANIFEST_NAME)));
+            }
+            ArtifactInfo artifact = registerArtifact(artifactFromArchive(source, role, manifest, entries));
+
+            for (Map.Entry<String, byte[]> entry : entries.entrySet()) {
+                String name = entry.getKey();
+                if (isNestedDependencyEntry(name)) {
+                    nestedArchives.add(new NestedArchive(entry.getValue(), source + "!/" + name, artifact));
+                }
+            }
+
+            boolean multiRelease = manifest != null && "true".equalsIgnoreCase(
+                    manifest.getMainAttributes().getValue(Attributes.Name.MULTI_RELEASE));
+            boolean containerArchive = applicationRoot && isContainerArchive(entries);
+            Map<String, VersionedClassEntry> selected = new TreeMap<>();
+            for (Map.Entry<String, byte[]> entry : entries.entrySet()) {
+                String name = entry.getKey();
+                if (!name.endsWith(".class")) continue;
+                if (name.endsWith("module-info.class")) continue;
+                VersionedClassEntry candidate = versionedClassEntry(name, entry.getValue(), multiRelease);
+                if (candidate == null || candidate.version > cfg.release) continue;
+                if (containerArchive && !isApplicationClassEntry(name)
+                        && !name.startsWith("META-INF/versions/")) continue;
+                VersionedClassEntry prior = selected.get(candidate.logicalName);
+                if (prior == null || candidate.version > prior.version) selected.put(candidate.logicalName, candidate);
+            }
+            for (VersionedClassEntry entry : selected.values()) {
+                loadClassBytes(entry.bytes, source + "!/" + entry.originalName, artifact, priority);
+            }
+        }
+
+        boolean isContainerArchive(Map<String, byte[]> entries) {
+            return entries.keySet().stream().anyMatch(name -> name.startsWith("BOOT-INF/classes/") || name.startsWith("WEB-INF/classes/"));
+        }
+
+        boolean isApplicationClassEntry(String name) {
+            return name.startsWith("BOOT-INF/classes/") || name.startsWith("WEB-INF/classes/");
+        }
+
+        boolean isNestedDependencyEntry(String name) {
+            return name.endsWith(".jar") && (name.startsWith("BOOT-INF/lib/") || name.startsWith("WEB-INF/lib/"));
+        }
+
+        VersionedClassEntry versionedClassEntry(String name, byte[] bytes, boolean multiRelease) {
+            if (!name.startsWith("META-INF/versions/")) return new VersionedClassEntry(name, name, 0, bytes);
+            if (!multiRelease) return null;
+            String remainder = name.substring("META-INF/versions/".length());
+            int slash = remainder.indexOf('/');
+            if (slash <= 0) return null;
+            try {
+                int version = Integer.parseInt(remainder.substring(0, slash));
+                String logical = remainder.substring(slash + 1);
+                return new VersionedClassEntry(logical, name, version, bytes);
+            } catch (NumberFormatException ex) {
+                return null;
+            }
+        }
+
+        ArtifactInfo artifactFromArchive(String source, ArtifactRole role, Manifest manifest, Map<String, byte[]> entries) {
+            String fileName = source;
+            int bang = fileName.lastIndexOf("!/");
+            if (bang >= 0) fileName = fileName.substring(bang + 2);
+            int slash = Math.max(fileName.lastIndexOf('/'), fileName.lastIndexOf(File.separatorChar));
+            if (slash >= 0) fileName = fileName.substring(slash + 1);
+
+            String coordinate = "";
+            String version = "";
+            for (Map.Entry<String, byte[]> entry : entries.entrySet()) {
+                String name = entry.getKey();
+                if (!name.startsWith("META-INF/maven/") || !name.endsWith("/pom.properties")) continue;
+                Properties properties = new Properties();
+                try { properties.load(new ByteArrayInputStream(entry.getValue())); }
+                catch (IOException ignored) { continue; }
+                String group = properties.getProperty("groupId", "").trim();
+                String artifact = properties.getProperty("artifactId", "").trim();
+                version = properties.getProperty("version", "").trim();
+                if (!artifact.isBlank()) coordinate = (group.isBlank() ? artifact : group + ":" + artifact)
+                        + (version.isBlank() ? "" : ":" + version);
+                break;
+            }
+
+            String module = "";
+            String title = "";
+            if (manifest != null) {
+                Attributes attrs = manifest.getMainAttributes();
+                module = value(attrs, "Automatic-Module-Name");
+                title = value(attrs, "Implementation-Title");
+                if (version.isBlank()) version = value(attrs, "Implementation-Version");
+            }
+            if (module.isBlank()) module = moduleNameFromEntries(entries, manifest);
