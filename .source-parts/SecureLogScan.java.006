@@ -1,0 +1,200 @@
+            if (summaries.computeIfAbsent(mk, k -> new MethodSummary()).stores.add(store)) changed = true;
+        }
+
+        void addMutation(MethodKey mk, MutationSummary mutation) {
+            if (summaries.computeIfAbsent(mk, k -> new MethodSummary()).mutations.add(mutation)) changed = true;
+        }
+
+        void addCallback(MethodKey mk, CallbackSummary callback) {
+            if (summaries.computeIfAbsent(mk, k -> new MethodSummary()).callbacks.add(callback)) changed = true;
+        }
+
+        MethodSummary summary(MethodKey mk) { return summaries.getOrDefault(mk, MethodSummary.EMPTY); }
+
+        Set<Source> renderingSources(Set<TypeRef> refs) {
+            Set<Source> out = new TreeSet<>();
+            for (TypeRef ref : refs) {
+                if (ref.array) continue; // Object.toString on an array does not render elements.
+                for (String runtimeType : dispatchTypes(ref)) {
+                    MethodKey toString = resolveVirtual(runtimeType, "toString", "()Ljava/lang/String;");
+                    if (toString == null) continue;
+                    MethodSummary s = summary(toString);
+                    for (Source source : s.returnSources) if (!isReceiverPlaceholder(source)) out.add(source);
+                    for (Source source : s.returnRenderSources) if (!isReceiverPlaceholder(source)) out.add(source);
+                }
+            }
+            return out;
+        }
+
+        Set<Source> exceptionTextSources(Set<TypeRef> refs) {
+            Set<Source> out = new TreeSet<>();
+            for (TypeRef ref : refs) {
+                if (ref.array) continue;
+                for (String runtimeType : dispatchTypes(ref)) {
+                    for (String methodName : List.of("getLocalizedMessage", "getMessage", "toString")) {
+                        MethodKey method = resolveVirtual(runtimeType, methodName, "()Ljava/lang/String;");
+                        if (method == null) continue;
+                        MethodSummary summary = summary(method);
+                        for (Source source : summary.returnSources) if (!isReceiverPlaceholder(source)) out.add(source);
+                        for (Source source : summary.returnRenderSources) if (!isReceiverPlaceholder(source)) out.add(source);
+                    }
+                }
+            }
+            return out;
+        }
+
+        Set<Source> serializedSources(Set<TypeRef> refs) {
+            Set<Source> out = new TreeSet<>();
+            Set<String> visited = new HashSet<>();
+            for (TypeRef ref : refs) {
+                if (ref.array) continue;
+                for (String runtimeType : dispatchTypes(ref)) collectSerializedClassSources(runtimeType, visited, out);
+            }
+            return out;
+        }
+
+        void collectSerializedClassSources(String type, Set<String> visited, Set<Source> out) {
+            if (type == null || !visited.add(type)) return;
+            ClassNode classNode = classes.get(type);
+            if (classNode == null) return;
+            for (FieldNode field : classNode.fields) {
+                if ((field.access & Opcodes.ACC_STATIC) != 0) continue;
+                FieldKey key = new FieldKey(classNode.name, field.name, field.desc);
+                out.addAll(fieldDirectSources(key));
+                out.addAll(fieldRenderSources(key));
+                out.addAll(fieldDeepRenderSources(key));
+                for (TypeRef fieldType : fieldTypes(key)) {
+                    if (fieldType.array) continue;
+                    for (String runtimeType : dispatchTypes(fieldType)) collectSerializedClassSources(runtimeType, visited, out);
+                }
+            }
+            collectSerializedClassSources(classNode.superName, visited, out);
+        }
+
+        boolean isReceiverPlaceholder(Source s) {
+            return s.kind != SourceKind.FIELD && s.paramOrdinal == 0;
+        }
+
+        List<String> dispatchTypes(TypeRef ref) {
+            if (ref.array) return List.of();
+            if (ref.exact) return classes.containsKey(ref.name) ? List.of(ref.name) : List.of();
+            ClassNode declared = classes.get(ref.name);
+            if (declared == null) return List.of();
+            List<String> out = new ArrayList<>();
+            for (String candidate : classes.keySet()) if (isAssignableFrom(ref.name, candidate)) out.add(candidate);
+            if (out.isEmpty()) out.add(ref.name);
+            return out;
+        }
+
+        boolean shouldResolveParameterType(TypeRef ref) {
+            if (ref == null || ref.array || ref.exact) return ref != null && ref.exact;
+            ClassNode cn = classes.get(ref.name);
+            if (cn == null || ref.name.equals("java/lang/Object")) return false;
+            return (cn.access & (Opcodes.ACC_INTERFACE | Opcodes.ACC_ABSTRACT)) == 0;
+        }
+
+        boolean isAssignableFrom(String parent, String child) {
+            if (parent.equals(child) || parent.equals("java/lang/Object")) return true;
+            Set<String> seen = new HashSet<>();
+            Deque<String> q = new ArrayDeque<>();
+            q.add(child);
+            while (!q.isEmpty()) {
+                String cur = q.removeFirst();
+                if (!seen.add(cur)) continue;
+                ClassNode cn = classes.get(cur);
+                if (cn == null) continue;
+                if (parent.equals(cn.superName)) return true;
+                if (cn.superName != null) q.addLast(cn.superName);
+                if (cn.interfaces != null) {
+                    for (String i : cn.interfaces) {
+                        if (parent.equals(i)) return true;
+                        q.addLast(i);
+                    }
+                }
+            }
+            return false;
+        }
+
+        MethodKey resolveVirtual(String runtimeType, String name, String desc) {
+            String cur = runtimeType;
+            Set<String> seen = new HashSet<>();
+            while (cur != null && seen.add(cur)) {
+                ClassNode cn = classes.get(cur);
+                if (cn == null) return null;
+                for (MethodNode mn : cn.methods) if (mn.name.equals(name) && mn.desc.equals(desc)) return new MethodKey(cn.name, name, desc);
+                MethodKey viaInterface = resolveInterfaceMethod(cn.interfaces, name, desc, new HashSet<>());
+                if (viaInterface != null) return viaInterface;
+                cur = cn.superName;
+            }
+            return null;
+        }
+
+        MethodKey resolveInterfaceMethod(List<String> interfaces, String name, String desc, Set<String> seen) {
+            if (interfaces == null) return null;
+            for (String i : interfaces) {
+                if (!seen.add(i)) continue;
+                ClassNode cn = classes.get(i);
+                if (cn == null) continue;
+                for (MethodNode mn : cn.methods) if (mn.name.equals(name) && mn.desc.equals(desc)) return new MethodKey(cn.name, name, desc);
+                MethodKey nested = resolveInterfaceMethod(cn.interfaces, name, desc, seen);
+                if (nested != null) return nested;
+            }
+            return null;
+        }
+
+        void loadBaseline() {
+            if (cfg.baselineFile == null) return;
+            try {
+                String text = Files.readString(cfg.baselineFile, StandardCharsets.UTF_8);
+                java.util.regex.Matcher matcher = java.util.regex.Pattern.compile("\\\"([0-9a-fA-F]{64})\\\"").matcher(text);
+                while (matcher.find()) baselineFingerprints.add(matcher.group(1).toLowerCase(Locale.ROOT));
+            } catch (IOException | RuntimeException ex) {
+                addFinding(Finding.incomplete("Unable to read baseline " + cfg.baselineFile + ": " + ex.getMessage()));
+            }
+        }
+
+        void writeBaselineIfRequested() {
+            if (cfg.writeBaselineFile == null) return;
+            try {
+                Path absolute = cfg.writeBaselineFile.toAbsolutePath().normalize();
+                Path parent = absolute.getParent();
+                if (parent != null) Files.createDirectories(parent);
+                Set<String> fingerprints = new TreeSet<>();
+                for (Finding finding : findings) {
+                    if (finding.severity.equals("ERROR") || finding.severity.equals("POSSIBLE")) {
+                        if (finding.suppression == null) fingerprints.add(finding.fingerprint());
+                    }
+                }
+                StringBuilder json = new StringBuilder();
+                json.append("{\n  \"version\": 1,\n  \"fingerprints\": [\n");
+                int index = 0;
+                for (String fingerprint : fingerprints) {
+                    if (index++ > 0) json.append(",\n");
+                    json.append("    \"").append(fingerprint).append("\"");
+                }
+                json.append("\n  ]\n}\n");
+                Files.writeString(absolute, json.toString(), StandardCharsets.UTF_8);
+            } catch (IOException | RuntimeException ex) {
+                addFinding(Finding.incomplete("Unable to write baseline " + cfg.writeBaselineFile + ": " + ex.getMessage()));
+            }
+        }
+
+        boolean isBaselined(Finding finding) { return baselineFingerprints.contains(finding.fingerprint()); }
+        boolean isSuppressed(Finding finding) { return finding.suppression != null; }
+        String disposition(Finding finding) {
+            if (finding.severity.equals("SANITIZED")) return "SANITIZED";
+            if (finding.severity.equals("INCOMPLETE")) return "ACTIVE";
+            if (isSuppressed(finding)) return "SUPPRESSED";
+            if (isBaselined(finding)) return "BASELINED";
+            return "NEW";
+        }
+
+        void printReport() throws IOException {
+            if (cfg.sarifOutput != null) {
+                Path parent = cfg.sarifOutput.toAbsolutePath().normalize().getParent();
+                if (parent != null) Files.createDirectories(parent);
+                Files.writeString(cfg.sarifOutput, buildSarif(), StandardCharsets.UTF_8);
+            }
+            if (cfg.sarif) printSarif();
+            else if (cfg.json) printJson();
+            else printText();
