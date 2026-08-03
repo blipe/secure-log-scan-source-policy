@@ -1,0 +1,200 @@
+            String id = !coordinate.isBlank() ? coordinate : (!title.isBlank() ? title + (version.isBlank() ? "" : ":" + version) : fileName);
+            return new ArtifactInfo(id, source, role, coordinate, module, version);
+        }
+
+        String moduleNameFromEntries(Map<String, byte[]> entries, Manifest manifest) {
+            boolean multiRelease = manifest != null && "true".equalsIgnoreCase(
+                    manifest.getMainAttributes().getValue(Attributes.Name.MULTI_RELEASE));
+            byte[] selected = entries.get("module-info.class");
+            int selectedVersion = 0;
+            if (multiRelease) {
+                for (Map.Entry<String, byte[]> entry : entries.entrySet()) {
+                    String name = entry.getKey();
+                    if (!name.startsWith("META-INF/versions/") || !name.endsWith("/module-info.class")) continue;
+                    String remainder = name.substring("META-INF/versions/".length());
+                    int slash = remainder.indexOf('/');
+                    if (slash <= 0) continue;
+                    try {
+                        int version = Integer.parseInt(remainder.substring(0, slash));
+                        if (version <= cfg.release && version > selectedVersion) {
+                            selectedVersion = version;
+                            selected = entry.getValue();
+                        }
+                    } catch (NumberFormatException ignored) {
+                        // Ignore malformed versioned metadata; class loading will still handle valid entries.
+                    }
+                }
+            }
+            if (selected == null) return "";
+            try {
+                ClassNode node = new ClassNode(ASM);
+                new ClassReader(selected).accept(node, ClassReader.SKIP_CODE | ClassReader.SKIP_DEBUG | ClassReader.SKIP_FRAMES);
+                return node.module == null || node.module.name == null ? "" : node.module.name;
+            } catch (RuntimeException ex) {
+                return "";
+            }
+        }
+
+        String value(Attributes attrs, String name) {
+            String value = attrs.getValue(name);
+            return value == null ? "" : value.trim();
+        }
+
+        ArtifactInfo registerArtifact(ArtifactInfo artifact) {
+            ArtifactInfo prior = artifacts.putIfAbsent(artifact.path, artifact);
+            return prior == null ? artifact : prior;
+        }
+
+        void loadJdkModule(String module) throws IOException {
+            FileSystem fs;
+            try { fs = FileSystems.getFileSystem(URI.create("jrt:/")); }
+            catch (FileSystemNotFoundException ex) { fs = FileSystems.newFileSystem(URI.create("jrt:/"), Map.of()); }
+            Path root = fs.getPath("/modules", module);
+            if (!Files.exists(root)) throw new IOException("Unknown runtime module: " + module);
+            ArtifactInfo artifact = registerArtifact(new ArtifactInfo("jrt:" + module, "jrt:/" + module,
+                    ArtifactRole.JDK_RUNTIME, "", module, Runtime.version().toString()));
+            try (var stream = Files.walk(root)) {
+                for (Path file : stream.filter(Files::isRegularFile).filter(p -> p.toString().endsWith(".class")).sorted().toList()) {
+                    if (file.getFileName().toString().equals("module-info.class")) continue;
+                    loadClassBytes(Files.readAllBytes(file), "jrt:/" + module + "/" + root.relativize(file), artifact, PRIORITY_JDK_RUNTIME);
+                }
+            }
+        }
+
+        void loadClassBytes(byte[] bytes, String source, ArtifactInfo artifact, int priority) {
+            try {
+                ClassReader reader = new ClassReader(bytes);
+                ClassNode node = new ClassNode(ASM);
+                reader.accept(node, 0);
+                ClassOrigin incoming = new ClassOrigin(source, artifact, priority, sha256(bytes));
+                ClassOrigin prior = classOrigins.get(node.name);
+                if (prior != null) {
+                    boolean identical = prior.sha256.equals(incoming.sha256);
+                    duplicateClasses.add(new DuplicateClass(node.name, prior, incoming, identical));
+                    if (cfg.duplicateClassPolicy == DuplicateClassPolicy.FAIL) {
+                        addFinding(Finding.incomplete("Duplicate class " + node.name.replace('/', '.')
+                                + " selected from " + prior.source + " and also found in " + source
+                                + (identical ? " (identical bytecode)" : " (conflicting bytecode)")));
+                    }
+                    return;
+                }
+                classOrigins.put(node.name, incoming);
+                classes.put(node.name, node);
+            } catch (RuntimeException ex) {
+                addFinding(Finding.incomplete("Unable to read " + source + ": " + ex));
+            }
+        }
+
+        String sha256(byte[] bytes) {
+            try {
+                byte[] digest = MessageDigest.getInstance("SHA-256").digest(bytes);
+                StringBuilder out = new StringBuilder(digest.length * 2);
+                for (byte b : digest) out.append(String.format(Locale.ROOT, "%02x", b & 0xff));
+                return out.toString();
+            } catch (NoSuchAlgorithmException ex) {
+                throw new IllegalStateException(ex);
+            }
+        }
+
+        ClassOrigin origin(String owner) { return classOrigins.get(owner); }
+        ArtifactInfo artifact(String owner) {
+            ClassOrigin origin = origin(owner);
+            return origin == null ? null : origin.artifact;
+        }
+
+        UncertaintyReason unknownCallReason(MethodInsnNode call, TaintValue receiver) {
+            if (!classes.containsKey(call.owner) && !isJdkOwner(call.owner)) return UncertaintyReason.UNRESOLVED_DEPENDENCY;
+            if ((call.getOpcode() == Opcodes.INVOKEVIRTUAL || call.getOpcode() == Opcodes.INVOKEINTERFACE)
+                    && hierarchyReferencesMissing(call.owner, new HashSet<>())) {
+                return UncertaintyReason.UNRESOLVED_DISPATCH_TARGET;
+            }
+            if (receiver != null) {
+                for (TypeRef type : receiver.types) {
+                    if (!type.array && hierarchyReferencesMissing(type.name, new HashSet<>())) {
+                        return UncertaintyReason.UNRESOLVED_DISPATCH_TARGET;
+                    }
+                }
+            }
+            return UncertaintyReason.UNKNOWN_METHOD_RETURN;
+        }
+
+        boolean hierarchyReferencesMissing(String type, Set<String> seen) {
+            if (type == null || !seen.add(type) || isJdkOwner(type)) return false;
+            ClassNode node = classes.get(type);
+            if (node == null) return true;
+            if (node.superName != null && !node.superName.equals("java/lang/Object")
+                    && hierarchyReferencesMissing(node.superName, seen)) return true;
+            if (node.interfaces != null) {
+                for (String iface : node.interfaces) if (hierarchyReferencesMissing(iface, seen)) return true;
+            }
+            return false;
+        }
+
+        boolean isJdkOwner(String owner) {
+            return owner.startsWith("java/") || owner.startsWith("javax/") || owner.startsWith("jdk/")
+                    || owner.startsWith("sun/") || owner.startsWith("com/sun/");
+        }
+
+        static final class VersionedClassEntry {
+            final String logicalName;
+            final String originalName;
+            final int version;
+            final byte[] bytes;
+            VersionedClassEntry(String logicalName, String originalName, int version, byte[] bytes) {
+                this.logicalName = logicalName;
+                this.originalName = originalName;
+                this.version = version;
+                this.bytes = bytes;
+            }
+        }
+
+        void collectSecureFields() {
+            effectiveSecureAnnotationDescs.clear();
+            effectiveSecureAnnotationDescs.addAll(cfg.annotationDescs);
+            expandSecureMetaAnnotations();
+
+            for (ClassNode cn : classes.values()) {
+                boolean annotationType = (cn.access & Opcodes.ACC_ANNOTATION) != 0;
+                if (!annotationType && hasSecureAnnotation(cn.visibleAnnotations, cn.invisibleAnnotations)) {
+                    FieldKey typeSource = new FieldKey(cn.name, "<type>", "L" + cn.name + ";");
+                    secureTypes.put(cn.name, typeSource);
+                    registerSecureSource(typeSource, null);
+                }
+
+                SuppressionInfo typeSuppression = suppressionFrom(cn.visibleAnnotations, cn.invisibleAnnotations,
+                        cn.name.replace('/', '.'));
+                if (typeSuppression != null) typeSuppressions.put(cn.name, typeSuppression);
+
+                Map<String, RecordComponentNode> recordComponents = new LinkedHashMap<>();
+                if (cn.recordComponents != null) {
+                    for (RecordComponentNode component : cn.recordComponents) {
+                        recordComponents.put(component.name + component.descriptor, component);
+                        if (hasSecureAnnotation(component.visibleAnnotations, component.invisibleAnnotations)) {
+                            FieldKey fieldSource = new FieldKey(cn.name, component.name, component.descriptor);
+                            registerSecureSource(fieldSource, null);
+                            MethodKey accessor = new MethodKey(cn.name, component.name, "()" + component.descriptor);
+                            secureMethodReturns.put(accessor, fieldSource);
+                        }
+                    }
+                }
+
+                for (FieldNode fn : cn.fields) {
+                    FieldKey fk = new FieldKey(cn.name, fn.name, fn.desc);
+                    boolean recordSecure = recordComponents.containsKey(fn.name + fn.desc)
+                            && hasSecureAnnotation(recordComponents.get(fn.name + fn.desc).visibleAnnotations,
+                            recordComponents.get(fn.name + fn.desc).invisibleAnnotations);
+                    if (hasSecureAnnotation(fn.visibleAnnotations, fn.invisibleAnnotations) || recordSecure) {
+                        registerSecureSource(fk, fn.value);
+                    }
+                    TypeRef declared = TypeRef.declared(Type.getType(fn.desc));
+                    if (declared != null) fieldTypes.computeIfAbsent(fk, k -> new TreeSet<>()).add(declared);
+                }
+
+                String canonicalRecordConstructor = canonicalRecordConstructor(cn);
+                for (MethodNode mn : cn.methods) {
+                    MethodKey mk = MethodKey.of(cn, mn);
+                    if (!mn.name.equals("<init>") && Type.getReturnType(mn.desc) != Type.VOID_TYPE
+                            && hasSecureAnnotation(mn.visibleAnnotations, mn.invisibleAnnotations)) {
+                        FieldKey source = secureMethodReturns.computeIfAbsent(mk, ignored ->
+                                new FieldKey(cn.name, mn.name + "@return", Type.getReturnType(mn.desc).getDescriptor()));
+                        registerSecureSource(source, null);
