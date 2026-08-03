@@ -1,0 +1,199 @@
+                    }
+
+                    int receiverOffset = (mn.access & Opcodes.ACC_STATIC) == 0 ? 1 : 0;
+                    Type[] argumentTypes = Type.getArgumentTypes(mn.desc);
+                    for (int parameterIndex = 0; parameterIndex < argumentTypes.length; parameterIndex++) {
+                        if (hasSecureParameterAnnotation(mn, parameterIndex)) {
+                            int ordinal = parameterIndex + receiverOffset;
+                            FieldKey source;
+                            if (canonicalRecordConstructor != null && mn.name.equals("<init>")
+                                    && mn.desc.equals(canonicalRecordConstructor) && cn.recordComponents != null
+                                    && parameterIndex < cn.recordComponents.size()
+                                    && hasSecureAnnotation(cn.recordComponents.get(parameterIndex).visibleAnnotations,
+                                    cn.recordComponents.get(parameterIndex).invisibleAnnotations)) {
+                                RecordComponentNode component = cn.recordComponents.get(parameterIndex);
+                                source = new FieldKey(cn.name, component.name, component.descriptor);
+                            } else {
+                                source = new FieldKey(cn.name,
+                                        mn.name + "@param" + parameterIndex, argumentTypes[parameterIndex].getDescriptor());
+                                registerSecureSource(source, null);
+                            }
+                            secureParameters.computeIfAbsent(mk, ignored -> new LinkedHashMap<>()).put(ordinal, source);
+                        }
+                    }
+
+                    AnnotationNode annotation = findAnnotation(mn.visibleAnnotations, cfg.sanitizeAnnotationDescs);
+                    if (annotation == null) annotation = findAnnotation(mn.invisibleAnnotations, cfg.sanitizeAnnotationDescs);
+                    if (annotation != null) {
+                        sanitizers.put(mk, new SanitizerInfo(mk,
+                                annotationString(annotation, "description"),
+                                annotationString(annotation, "justification")));
+                    }
+
+                    SuppressionInfo methodSuppression = suppressionFrom(mn.visibleAnnotations, mn.invisibleAnnotations,
+                            mk.toString());
+                    if (methodSuppression != null) methodSuppressions.put(mk, methodSuppression);
+                }
+            }
+            propagateInheritedSecureContracts();
+        }
+
+        void propagateInheritedSecureContracts() {
+            for (MethodKey method : new ArrayList<>(methodsDeclaredInClasses())) {
+                for (String ancestor : ancestorTypes(method.owner)) {
+                    MethodKey declaration = new MethodKey(ancestor, method.name, method.desc);
+                    FieldKey returnSource = secureMethodReturns.get(declaration);
+                    if (returnSource != null) secureMethodReturns.putIfAbsent(method, returnSource);
+                    Map<Integer, FieldKey> inheritedParameters = secureParameters.get(declaration);
+                    if (inheritedParameters != null && !inheritedParameters.isEmpty()) {
+                        Map<Integer, FieldKey> target = secureParameters.computeIfAbsent(method, ignored -> new LinkedHashMap<>());
+                        for (Map.Entry<Integer, FieldKey> entry : inheritedParameters.entrySet()) {
+                            target.putIfAbsent(entry.getKey(), entry.getValue());
+                        }
+                    }
+                }
+            }
+        }
+
+        Set<MethodKey> methodsDeclaredInClasses() {
+            Set<MethodKey> out = new LinkedHashSet<>();
+            for (ClassNode owner : classes.values()) {
+                for (MethodNode method : owner.methods) out.add(MethodKey.of(owner, method));
+            }
+            return out;
+        }
+
+        Set<String> ancestorTypes(String owner) {
+            Set<String> out = new LinkedHashSet<>();
+            Deque<String> queue = new ArrayDeque<>();
+            ClassNode start = classes.get(owner);
+            if (start != null) {
+                if (start.superName != null) queue.add(start.superName);
+                if (start.interfaces != null) queue.addAll(start.interfaces);
+            }
+            while (!queue.isEmpty()) {
+                String current = queue.removeFirst();
+                if (!out.add(current)) continue;
+                ClassNode node = classes.get(current);
+                if (node == null) continue;
+                if (node.superName != null) queue.addLast(node.superName);
+                if (node.interfaces != null) queue.addAll(node.interfaces);
+            }
+            return out;
+        }
+
+        void registerSecureSource(FieldKey source, Object constantValue) {
+            annotatedSecureFields.add(source);
+            taintedFields.add(source);
+            fieldDirectSources.computeIfAbsent(source, ignored -> new TreeSet<>()).add(Source.field(source));
+            if (constantValue != null) secureConstantFields.computeIfAbsent(constantValue, ignored -> new TreeSet<>()).add(source);
+        }
+
+        void expandSecureMetaAnnotations() {
+            boolean expanded;
+            do {
+                expanded = false;
+                for (ClassNode annotationClass : classes.values()) {
+                    if ((annotationClass.access & Opcodes.ACC_ANNOTATION) == 0) continue;
+                    String descriptor = "L" + annotationClass.name + ";";
+                    if (effectiveSecureAnnotationDescs.contains(descriptor)) continue;
+                    if (containsDescriptor(annotationClass.visibleAnnotations, effectiveSecureAnnotationDescs)
+                            || containsDescriptor(annotationClass.invisibleAnnotations, effectiveSecureAnnotationDescs)) {
+                        effectiveSecureAnnotationDescs.add(descriptor);
+                        expanded = true;
+                    }
+                }
+            } while (expanded);
+        }
+
+        boolean containsDescriptor(List<AnnotationNode> annotations, Set<String> descriptors) {
+            if (annotations == null) return false;
+            for (AnnotationNode annotation : annotations) if (descriptors.contains(annotation.desc)) return true;
+            return false;
+        }
+
+        boolean hasSecureAnnotation(List<AnnotationNode> visible, List<AnnotationNode> invisible) {
+            return containsDescriptor(visible, effectiveSecureAnnotationDescs)
+                    || containsDescriptor(invisible, effectiveSecureAnnotationDescs);
+        }
+
+        boolean hasSecureParameterAnnotation(MethodNode method, int parameterIndex) {
+            return hasParameterAnnotation(method.visibleParameterAnnotations, parameterIndex)
+                    || hasParameterAnnotation(method.invisibleParameterAnnotations, parameterIndex);
+        }
+
+        boolean hasParameterAnnotation(List<AnnotationNode>[] annotations, int parameterIndex) {
+            return annotations != null && parameterIndex >= 0 && parameterIndex < annotations.length
+                    && containsDescriptor(annotations[parameterIndex], effectiveSecureAnnotationDescs);
+        }
+
+        String canonicalRecordConstructor(ClassNode cn) {
+            if (cn.recordComponents == null || cn.recordComponents.isEmpty()) return null;
+            StringBuilder descriptor = new StringBuilder("(");
+            for (RecordComponentNode component : cn.recordComponents) descriptor.append(component.descriptor);
+            return descriptor.append(")V").toString();
+        }
+
+        FieldKey secureParameterSource(MethodKey method, int ordinal) {
+            return secureParameters.getOrDefault(method, Map.of()).get(ordinal);
+        }
+
+        Set<Source> secureTypeSources(Type type) {
+            if (type == null || type.getSort() != Type.OBJECT) return Set.of();
+            FieldKey source = secureTypeSource(type.getInternalName(), new HashSet<>());
+            return source == null ? Set.of() : Set.of(Source.field(source));
+        }
+
+        FieldKey secureTypeSource(String type, Set<String> visited) {
+            if (type == null || !visited.add(type)) return null;
+            FieldKey direct = secureTypes.get(type);
+            if (direct != null) return direct;
+            ClassNode node = classes.get(type);
+            if (node == null) return null;
+            FieldKey fromSuper = secureTypeSource(node.superName, visited);
+            if (fromSuper != null) return fromSuper;
+            if (node.interfaces != null) {
+                for (String iface : node.interfaces) {
+                    FieldKey fromInterface = secureTypeSource(iface, visited);
+                    if (fromInterface != null) return fromInterface;
+                }
+            }
+            return null;
+        }
+
+        SuppressionInfo suppressionFrom(List<AnnotationNode> visible, List<AnnotationNode> invisible, String location) {
+            AnnotationNode annotation = findAnnotation(visible, cfg.suppressionAnnotationDescs);
+            if (annotation == null) annotation = findAnnotation(invisible, cfg.suppressionAnnotationDescs);
+            if (annotation == null) return null;
+            String reason = annotationString(annotation, "reason").trim();
+            String ticket = annotationString(annotation, "ticket").trim();
+            String expires = annotationString(annotation, "expires").trim();
+            if (reason.isBlank()) {
+                addFinding(Finding.incomplete("Invalid suppression at " + location + ": reason must not be blank"));
+                return null;
+            }
+            if (cfg.requireSuppressionTicket && ticket.isBlank()) {
+                addFinding(Finding.incomplete("Invalid suppression at " + location + ": ticket is required"));
+                return null;
+            }
+            if (!expires.isBlank()) {
+                try {
+                    LocalDate expiration = LocalDate.parse(expires);
+                    if (expiration.isBefore(LocalDate.now())) {
+                        addFinding(Finding.incomplete("Expired suppression at " + location + ": " + expires));
+                        return null;
+                    }
+                } catch (DateTimeParseException ex) {
+                    addFinding(Finding.incomplete("Invalid suppression expiration at " + location
+                            + ": expected yyyy-MM-dd but got " + expires));
+                    return null;
+                }
+            }
+            return new SuppressionInfo(reason, ticket, expires, location);
+        }
+
+        SuppressionInfo suppression(MethodKey method) {
+            SuppressionInfo direct = methodSuppressions.get(method);
+            return direct != null ? direct : typeSuppressions.get(method.owner);
+        }
+
