@@ -1,0 +1,200 @@
+        boolean failOnNew;
+        boolean requireSuppressionTicket;
+        boolean conservativeUnknownCalls = true;
+        boolean allowPossible;
+        boolean allowIncompleteAnalysis;
+        boolean help;
+        long maxWorkItems = 10_000_000L;
+        int release = Runtime.version().feature();
+        DuplicateClassPolicy duplicateClassPolicy = DuplicateClassPolicy.FAIL;
+        DependencyFindingsPolicy dependencyFindingsPolicy = DependencyFindingsPolicy.REPORT;
+
+        Config() {
+            annotationDescs.add(DEFAULT_SECURE_ANNOTATION_DESC);
+            sanitizeAnnotationDescs.add(DEFAULT_SANITIZE_ANNOTATION_DESC);
+            suppressionAnnotationDescs.add(DEFAULT_SUPPRESSION_ANNOTATION_DESC);
+        }
+
+        static Config parse(String[] args) {
+            Config c = new Config();
+            for (String a : args) {
+                if (a.equals("--help") || a.equals("-h")) c.help = true;
+                else if (a.equals("--json")) c.json = true;
+                else if (a.equals("--sarif")) c.sarif = true;
+                else if (a.startsWith("--sarif=")) c.sarifOutput = Paths.get(a.substring("--sarif=".length()).trim());
+                else if (a.equals("--fail")) c.failOnFinding = true;
+                else if (a.equals("--fail-on-new")) c.failOnNew = true;
+                else if (a.equals("--require-suppression-ticket")) c.requireSuppressionTicket = true;
+                else if (a.equals("--no-conservative-unknown-calls")) c.conservativeUnknownCalls = false;
+                else if (a.equals("--allow-possible")) c.allowPossible = true;
+                else if (a.equals("--allow-incomplete-analysis")) c.allowIncompleteAnalysis = true;
+                else if (a.startsWith("--annotation=")) c.annotationDescs.add(toAnnotationDesc(a.substring("--annotation=".length()).trim()));
+                else if (a.startsWith("--sanitize-annotation=")) c.sanitizeAnnotationDescs.add(toAnnotationDesc(a.substring("--sanitize-annotation=".length()).trim()));
+                else if (a.startsWith("--suppression-annotation=")) c.suppressionAnnotationDescs.add(toAnnotationDesc(a.substring("--suppression-annotation=".length()).trim()));
+                else if (a.startsWith("--baseline=")) c.baselineFile = Paths.get(a.substring("--baseline=".length()).trim());
+                else if (a.startsWith("--write-baseline=")) c.writeBaselineFile = Paths.get(a.substring("--write-baseline=".length()).trim());
+                else if (a.startsWith("--model=")) c.modelFiles.add(Paths.get(a.substring("--model=".length()).trim()));
+                else if (a.startsWith("--models=")) c.modelFiles.add(Paths.get(a.substring("--models=".length()).trim()));
+                else if (a.startsWith("--max-work-items=")) c.maxWorkItems = Long.parseLong(a.substring("--max-work-items=".length()));
+                else if (a.startsWith("--release=")) c.release = Integer.parseInt(a.substring("--release=".length()));
+                else if (a.startsWith("--classpath=")) addPathList(c.classpathRoots, c.jdkModules, a.substring("--classpath=".length()), false);
+                else if (a.startsWith("--class-path=")) addPathList(c.classpathRoots, c.jdkModules, a.substring("--class-path=".length()), false);
+                else if (a.startsWith("--dependency=")) addPathList(c.classpathRoots, c.jdkModules, a.substring("--dependency=".length()), false);
+                else if (a.startsWith("--module-path=")) addPathList(c.modulePathRoots, c.jdkModules, a.substring("--module-path=".length()), true);
+                else if (a.startsWith("--jdk-module=")) addCommaList(c.jdkModules, a.substring("--jdk-module=".length()));
+                else if (a.startsWith("--jdk-modules=")) addCommaList(c.jdkModules, a.substring("--jdk-modules=".length()));
+                else if (a.startsWith("--duplicate-classes=")) c.duplicateClassPolicy = parseEnum(DuplicateClassPolicy.class, a.substring("--duplicate-classes=".length()));
+                else if (a.startsWith("--dependency-findings=")) c.dependencyFindingsPolicy = parseEnum(DependencyFindingsPolicy.class, a.substring("--dependency-findings=".length()));
+                else c.roots.add(Paths.get(a));
+            }
+            if (c.release < 8) throw new IllegalArgumentException("--release must be at least 8");
+            if (c.json && c.sarif) throw new IllegalArgumentException("--json and --sarif are mutually exclusive");
+            return c;
+        }
+
+        static <E extends Enum<E>> E parseEnum(Class<E> type, String value) {
+            try { return Enum.valueOf(type, value.trim().toUpperCase(Locale.ROOT)); }
+            catch (IllegalArgumentException ex) {
+                throw new IllegalArgumentException("Invalid " + type.getSimpleName() + " value: " + value, ex);
+            }
+        }
+
+        static void addCommaList(List<String> target, String value) {
+            for (String item : value.split(",")) if (!item.isBlank()) target.add(item.trim());
+        }
+
+        static void addPathList(List<Path> target, List<String> jdkModules, String value, boolean modulePath) {
+            if (value == null || value.isBlank()) return;
+            String separator = File.pathSeparator;
+            String[] parts;
+            if (value.startsWith("jrt:/")) parts = new String[]{value};
+            else parts = value.split(java.util.regex.Pattern.quote(separator));
+            for (String part : parts) {
+                if (part.isBlank()) continue;
+                String trimmed = part.trim();
+                if (trimmed.startsWith("jrt:/")) {
+                    String module = trimmed.substring("jrt:/".length());
+                    if (module.startsWith("modules/")) module = module.substring("modules/".length());
+                    if (module.endsWith("/")) module = module.substring(0, module.length() - 1);
+                    if (!module.isBlank()) jdkModules.add(module);
+                } else target.add(Paths.get(trimmed));
+            }
+        }
+
+        static String toAnnotationDesc(String v) {
+            if (v.startsWith("L") && v.endsWith(";")) return v;
+            return "L" + v.replace('.', '/') + ";";
+        }
+
+        static void printHelp() {
+            System.out.println("Usage: java <exports> securelogscan.SecureLogScan [options] <application-class-dir|class|jar>...");
+            System.out.println("Options:");
+            System.out.println("  --classpath=<paths>                 Dependency class directories/JARs in precedence order");
+            System.out.println("  --module-path=<paths>               Dependency module directories/JARs; jrt:/<module> is accepted");
+            System.out.println("  --jdk-module=<name[,name...]>       Analyze selected runtime modules through jrt:/");
+            System.out.println("  --release=<N>                       Multi-release JAR target, default current runtime feature");
+            System.out.println("  --duplicate-classes=fail|first      Conflicting duplicate policy, default fail");
+            System.out.println("  --dependency-findings=report|fail|ignore  Dependency-internal finding policy, default report");
+            System.out.println("  --annotation=<fqcn|Linternal/Desc;> Secure annotation, default secure.Secure");
+            System.out.println("  --sanitize-annotation=<fqcn|desc>   Sanitizer annotation, default secure.Sanitize");
+            System.out.println("  --suppression-annotation=<fqcn|desc> Suppression annotation, default secure.SuppressSecureLog");
+            System.out.println("  --baseline=<path>                   Mark matching stable fingerprints as BASELINED");
+            System.out.println("  --write-baseline=<path>             Write current unsafe/possible fingerprints as JSON");
+            System.out.println("  --fail-on-new                       Fail only on unsuppressed findings absent from the baseline");
+            System.out.println("  --require-suppression-ticket        Reject suppressions without a ticket");
+            System.out.println("  --model=<path>                      Load exact external method models; repeatable");
+            System.out.println("  --json                              Emit JSON report");
+            System.out.println("  --sarif                             Emit SARIF 2.1.0 to stdout");
+            System.out.println("  --sarif=<path>                      Also write SARIF 2.1.0 to a file");
+            System.out.println("  --fail                              Exit 1 on applicable UNSAFE, POSSIBLE, or incomplete analysis");
+            System.out.println("  --allow-possible                    With --fail, do not fail on POSSIBLE findings");
+            System.out.println("  --allow-incomplete-analysis         With --fail, do not fail when analysis is incomplete");
+            System.out.println("  --no-conservative-unknown-calls     Do not track unknown method returns from tracked args");
+            System.out.println("  --max-work-items=N                  Safety cap for worklist processing, default 10000000");
+        }
+    }
+
+    static final class ArtifactInfo implements Comparable<ArtifactInfo> {
+        final String id;
+        final String path;
+        final ArtifactRole role;
+        final String coordinate;
+        final String moduleName;
+        final String version;
+
+        ArtifactInfo(String id, String path, ArtifactRole role, String coordinate, String moduleName, String version) {
+            this.id = id == null || id.isBlank() ? path : id;
+            this.path = path;
+            this.role = role;
+            this.coordinate = coordinate == null ? "" : coordinate;
+            this.moduleName = moduleName == null ? "" : moduleName;
+            this.version = version == null ? "" : version;
+        }
+
+        String displayName() {
+            if (!coordinate.isBlank()) return coordinate;
+            if (!moduleName.isBlank() && !version.isBlank()) return moduleName + ":" + version;
+            if (!moduleName.isBlank()) return moduleName;
+            return id;
+        }
+
+        @Override public int compareTo(ArtifactInfo other) {
+            int c = role.compareTo(other.role); if (c != 0) return c;
+            c = displayName().compareTo(other.displayName()); if (c != 0) return c;
+            return path.compareTo(other.path);
+        }
+    }
+
+    static final class ClassOrigin {
+        final String source;
+        final ArtifactInfo artifact;
+        final int priority;
+        final String sha256;
+
+        ClassOrigin(String source, ArtifactInfo artifact, int priority, String sha256) {
+            this.source = source;
+            this.artifact = artifact;
+            this.priority = priority;
+            this.sha256 = sha256;
+        }
+    }
+
+    static final class NestedArchive {
+        final byte[] bytes;
+        final String source;
+        final ArtifactInfo parent;
+        NestedArchive(byte[] bytes, String source, ArtifactInfo parent) {
+            this.bytes = bytes;
+            this.source = source;
+            this.parent = parent;
+        }
+    }
+
+    static final class DuplicateClass implements Comparable<DuplicateClass> {
+        final String className;
+        final ClassOrigin selected;
+        final ClassOrigin duplicate;
+        final boolean identical;
+
+        DuplicateClass(String className, ClassOrigin selected, ClassOrigin duplicate, boolean identical) {
+            this.className = className;
+            this.selected = selected;
+            this.duplicate = duplicate;
+            this.identical = identical;
+        }
+
+        @Override public int compareTo(DuplicateClass other) {
+            int c = className.compareTo(other.className); if (c != 0) return c;
+            c = selected.source.compareTo(other.selected.source); if (c != 0) return c;
+            return duplicate.source.compareTo(other.duplicate.source);
+        }
+    }
+
+    static final class ScanModel {
+        static final int PRIORITY_APPLICATION = 300;
+        static final int PRIORITY_EXPLICIT_DEPENDENCY = 200;
+        static final int PRIORITY_MODULE_PATH = 180;
+        static final int PRIORITY_NESTED_DEPENDENCY = 100;
+        static final int PRIORITY_JDK_RUNTIME = 10;
+
+        final Config cfg;
