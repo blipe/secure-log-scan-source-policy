@@ -1,0 +1,250 @@
+        void loadMethodModels() {
+            for (Path modelFile : cfg.modelFiles) {
+                try {
+                    methodModels.load(modelFile, this);
+                } catch (IOException | RuntimeException ex) {
+                    addFinding(Finding.incomplete("Unable to load method model " + modelFile + ": " + ex.getMessage()));
+                }
+            }
+        }
+
+        AnnotationNode findAnnotation(List<AnnotationNode> annotations, Set<String> descriptors) {
+            if (annotations == null) return null;
+            for (AnnotationNode annotation : annotations) if (descriptors.contains(annotation.desc)) return annotation;
+            return null;
+        }
+
+        String annotationString(AnnotationNode annotation, String key) {
+            if (annotation == null || annotation.values == null) return "";
+            for (int i = 0; i + 1 < annotation.values.size(); i += 2) {
+                if (key.equals(annotation.values.get(i))) return String.valueOf(annotation.values.get(i + 1));
+            }
+            return "";
+        }
+
+        SanitizerInfo sanitizer(MethodKey method) { return sanitizers.get(method); }
+
+        void analyzeToFixpoint() {
+            for (ClassNode cn : classes.values()) {
+                for (MethodNode mn : cn.methods) {
+                    MethodKey key = MethodKey.of(cn, mn);
+                    MethodSummary initial = new MethodSummary();
+                    FieldKey secureReturn = secureMethodReturns.get(key);
+                    if (secureReturn != null) initial.returnSources.add(Source.field(secureReturn));
+                    summaries.put(key, initial);
+                    methods.put(key, mn);
+                }
+            }
+            discoverDeferredLambdaBodies();
+
+            ArrayDeque<MethodKey> worklist = new ArrayDeque<>();
+            Set<MethodKey> queued = new LinkedHashSet<>();
+            enqueueAll(worklist, queued);
+
+            while (!worklist.isEmpty()) {
+                if (cfg.maxWorkItems > 0 && analyzedWorkItems >= cfg.maxWorkItems) {
+                    addFinding(Finding.incomplete("Worklist safety limit reached after " + analyzedWorkItems
+                            + " method analyses; results may be incomplete"));
+                    return;
+                }
+                MethodKey key = worklist.removeFirst();
+                queued.remove(key);
+                MethodNode method = methods.get(key);
+                ClassNode owner = classes.get(key.owner);
+                if (method == null || owner == null) {
+                    addFinding(Finding.incomplete("Internal worklist entry could not be resolved: " + key));
+                    continue;
+                }
+                analyzedWorkItems++;
+                changed = false;
+                analyzeMethod(owner, method);
+                if (changed) enqueueAll(worklist, queued);
+            }
+        }
+
+
+        void discoverDeferredLambdaBodies() {
+            deferredLambdaBodies.clear();
+            for (ClassNode owner : classes.values()) {
+                for (MethodNode method : owner.methods) {
+                    for (AbstractInsnNode insn = method.instructions.getFirst(); insn != null; insn = insn.getNext()) {
+                        if (!(insn instanceof InvokeDynamicInsnNode indy)) continue;
+                        String bootstrapOwner = indy.bsm == null ? "" : indy.bsm.getOwner();
+                        if (!bootstrapOwner.equals("java/lang/invoke/LambdaMetafactory")
+                                && !bootstrapOwner.equals("java/lang/invoke/InnerClassLambdaMetafactory")) continue;
+                        Handle implementation = null;
+                        for (Object argument : indy.bsmArgs) {
+                            if (argument instanceof Handle handle) {
+                                implementation = handle;
+                                break;
+                            }
+                        }
+                        if (implementation == null) continue;
+                        MethodKey key = new MethodKey(implementation.getOwner(), implementation.getName(), implementation.getDesc());
+                        MethodNode implementationMethod = methods.get(key);
+                        if (implementationMethod == null) continue;
+                        // Only synthetic lambda bodies are deferred. Normal methods used by a method reference remain
+                        // ordinary independently reachable methods and are analyzed/reported normally.
+                        if ((implementationMethod.access & Opcodes.ACC_SYNTHETIC) != 0
+                                && implementationMethod.name.startsWith("lambda$")) {
+                            deferredLambdaBodies.add(key);
+                        }
+                    }
+                }
+            }
+        }
+
+        boolean isDeferredLambdaBody(MethodKey method) {
+            return deferredLambdaBodies.contains(method);
+        }
+
+        void enqueueAll(ArrayDeque<MethodKey> worklist, Set<MethodKey> queued) {
+            for (MethodKey key : methods.keySet()) {
+                if (queued.add(key)) worklist.addLast(key);
+            }
+        }
+
+        void analyzeMethod(ClassNode cn, MethodNode mn) {
+            MethodKey mk = MethodKey.of(cn, mn);
+            TaintInterpreter interp = new TaintInterpreter(this, cn, mn, mk);
+            Analyzer<TaintValue> analyzer = new Analyzer<>(interp);
+            try {
+                analyzer.analyze(cn.name, mn);
+            } catch (AnalyzerException | RuntimeException ex) {
+                addFinding(Finding.incomplete("Analyzer skipped " + mk + ": " + ex.getMessage()));
+            }
+        }
+
+        boolean hasFailingFinding() {
+            for (Finding finding : findings) {
+                if (finding.severity.equals("INCOMPLETE") && !cfg.allowIncompleteAnalysis) return true;
+                if (isSuppressed(finding)) continue;
+                if (cfg.failOnNew && isBaselined(finding)) continue;
+                FindingScope scope = findingScope(finding);
+                boolean dependencyInternal = scope == FindingScope.DEPENDENCY_INTERNAL;
+                if (dependencyInternal && cfg.dependencyFindingsPolicy != DependencyFindingsPolicy.FAIL) continue;
+                if (finding.severity.equals("ERROR")) return true;
+                if (finding.severity.equals("POSSIBLE") && !cfg.allowPossible) return true;
+            }
+            return false;
+        }
+
+        FindingScope findingScope(Finding finding) {
+            if (finding.category == SinkCategory.ANALYSIS) return FindingScope.ANALYSIS;
+            ArtifactInfo sinkArtifact = artifact(finding.sinkArtifactOwner);
+            boolean sinkApplication = sinkArtifact == null || sinkArtifact.role == ArtifactRole.APPLICATION;
+            boolean hasApplicationSource = false;
+            boolean hasDependencySource = false;
+            for (FieldKey field : finding.fields) {
+                ArtifactInfo sourceArtifact = artifact(field.owner);
+                if (sourceArtifact == null || sourceArtifact.role == ArtifactRole.APPLICATION) hasApplicationSource = true;
+                else hasDependencySource = true;
+            }
+            if (sinkApplication) return hasDependencySource ? FindingScope.CROSS_BOUNDARY : FindingScope.APPLICATION;
+            return hasApplicationSource ? FindingScope.CROSS_BOUNDARY : FindingScope.DEPENDENCY_INTERNAL;
+        }
+
+        List<Finding> visibleFindings() {
+            List<Finding> out = new ArrayList<>();
+            for (Finding finding : findings) {
+                if (cfg.dependencyFindingsPolicy == DependencyFindingsPolicy.IGNORE
+                        && findingScope(finding) == FindingScope.DEPENDENCY_INTERNAL) continue;
+                out.add(finding);
+            }
+            return out;
+        }
+
+        String artifactDisplay(String owner) {
+            ArtifactInfo artifact = artifact(owner);
+            return artifact == null ? "unresolved" : artifact.displayName() + " [" + artifact.role + "]";
+        }
+
+        void addFinding(Finding finding) {
+            if (finding.severity.equals("ERROR")) {
+                findings.removeIf(existing -> (existing.severity.equals("POSSIBLE") || existing.severity.equals("SANITIZED"))
+                        && existing.sameSinkLocation(finding)
+                        && !Collections.disjoint(existing.fields, finding.fields));
+                findings.add(finding);
+                return;
+            }
+            if (finding.severity.equals("POSSIBLE")) {
+                boolean unsafeAlreadyReported = findings.stream().anyMatch(existing -> existing.severity.equals("ERROR")
+                        && existing.sameSinkLocation(finding)
+                        && !Collections.disjoint(existing.fields, finding.fields));
+                if (unsafeAlreadyReported) return;
+                findings.removeIf(existing -> existing.severity.equals("SANITIZED")
+                        && existing.sameSinkLocation(finding)
+                        && !Collections.disjoint(existing.fields, finding.fields));
+                findings.add(finding);
+                return;
+            }
+            if (finding.severity.equals("SANITIZED")) {
+                boolean strongerAlreadyReported = findings.stream().anyMatch(existing ->
+                        (existing.severity.equals("ERROR") || existing.severity.equals("POSSIBLE"))
+                                && existing.sameSinkLocation(finding)
+                                && !Collections.disjoint(existing.fields, finding.fields));
+                if (strongerAlreadyReported) return;
+            }
+            findings.add(finding);
+        }
+        void addTaintedField(FieldKey fk) { if (taintedFields.add(fk)) changed = true; }
+
+        void addFieldDirectSources(FieldKey fk, Set<Source> sources) {
+            if (sources.isEmpty()) return;
+            if (fieldDirectSources.computeIfAbsent(fk, k -> new TreeSet<>()).addAll(sources)) changed = true;
+        }
+
+        Set<Source> fieldDirectSources(FieldKey fk) { return fieldDirectSources.getOrDefault(fk, Set.of()); }
+
+        void addFieldRenderSources(FieldKey fk, Set<Source> sources) {
+            if (sources.isEmpty()) return;
+            if (fieldRenderSources.computeIfAbsent(fk, k -> new TreeSet<>()).addAll(sources)) changed = true;
+        }
+
+        void addFieldDeepRenderSources(FieldKey fk, Set<Source> sources) {
+            if (sources.isEmpty()) return;
+            if (fieldDeepRenderSources.computeIfAbsent(fk, k -> new TreeSet<>()).addAll(sources)) changed = true;
+        }
+
+        void addFieldTypes(FieldKey fk, Set<TypeRef> types) {
+            if (types.isEmpty()) return;
+            if (fieldTypes.computeIfAbsent(fk, k -> new TreeSet<>()).addAll(types)) changed = true;
+        }
+
+        Set<Source> fieldRenderSources(FieldKey fk) { return fieldRenderSources.getOrDefault(fk, Set.of()); }
+        Set<Source> fieldDeepRenderSources(FieldKey fk) { return fieldDeepRenderSources.getOrDefault(fk, Set.of()); }
+        Set<Source> fieldCompletionFailureSources(FieldKey fk) { return fieldCompletionFailureSources.getOrDefault(fk, Set.of()); }
+        void addFieldCompletionFailureSources(FieldKey fk, Set<Source> sources) {
+            if (sources.isEmpty()) return;
+            if (fieldCompletionFailureSources.computeIfAbsent(fk, k -> new TreeSet<>()).addAll(sources)) changed = true;
+        }
+        Set<TypeRef> fieldTypes(FieldKey fk) { return fieldTypes.getOrDefault(fk, Set.of()); }
+        Set<LambdaTemplate> fieldLambdas(FieldKey fk) { return fieldLambdas.getOrDefault(fk, Set.of()); }
+
+        void addFieldLambdas(FieldKey fk, Set<LambdaTemplate> lambdas) {
+            if (lambdas.isEmpty()) return;
+            if (fieldLambdas.computeIfAbsent(fk, k -> new TreeSet<>()).addAll(lambdas)) changed = true;
+        }
+
+        Set<Source> constantSources(Object value) {
+            Set<Source> out = new TreeSet<>();
+            for (FieldKey field : secureConstantFields.getOrDefault(value, Set.of())) out.add(Source.possibleField(field));
+            return out;
+        }
+
+        void addReturnSources(MethodKey mk, Set<Source> direct, Set<Source> render, Set<Source> deepRender,
+                              Set<Source> completionFailures, Set<TypeRef> types, Set<LambdaTemplate> lambdas) {
+            MethodSummary s = summaries.computeIfAbsent(mk, k -> new MethodSummary());
+            if (s.returnSources.addAll(direct)) changed = true;
+            if (s.returnRenderSources.addAll(render)) changed = true;
+            if (s.returnDeepRenderSources.addAll(deepRender)) changed = true;
+            if (s.returnCompletionFailureSources.addAll(completionFailures)) changed = true;
+            if (s.returnTypes.addAll(types)) changed = true;
+            if (s.returnLambdas.addAll(lambdas)) changed = true;
+        }
+
+        void addSinkSources(MethodKey mk, SinkSummary sink) {
+            if (summaries.computeIfAbsent(mk, k -> new MethodSummary()).sinks.add(sink)) changed = true;
+        }
+
+        void addStoreSources(MethodKey mk, StoreSummary store) {
