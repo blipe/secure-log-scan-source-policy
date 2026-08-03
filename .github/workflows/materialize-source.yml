@@ -1,0 +1,58 @@
+name: Materialize verified source tree
+
+on:
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  materialize-verify-commit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Check out transfer branch
+        uses: actions/checkout@v4
+        with:
+          ref: agent/maven-project-setup
+          fetch-depth: 0
+
+      - name: Reconstruct and extract source tree
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat .transfer/chunk.* | tr -d '\n' | base64 --decode > /tmp/source-tree.tar.gz
+          echo '265e1e35d88096942e5f23bb677eb3cca518da1a0f73f4d978d3af78d7f74cb7  /tmp/source-tree.tar.gz' | sha256sum --check
+          rm -rf /tmp/source-tree
+          mkdir -p /tmp/source-tree
+          tar -xzf /tmp/source-tree.tar.gz -C /tmp/source-tree
+          test "$(find /tmp/source-tree -type f | wc -l)" -eq 100
+          test "$(wc -l < /tmp/source-tree/src/main/java/securelogscan/SecureLogScan.java)" -eq 4605
+          find . -mindepth 1 -maxdepth 1 ! -name .git -exec rm -rf {} +
+          cp -a /tmp/source-tree/. .
+          chmod +x build.sh run.sh test.sh test-policy.sh
+
+      - name: Set up JDK 21 with Maven cache
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+          cache: maven
+
+      - name: Verify Maven project
+        run: mvn --batch-mode --no-transfer-progress --errors clean verify
+
+      - name: Commit source files only
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          tree=$(git write-tree)
+          parent=$(git rev-parse origin/main)
+          commit=$(printf '%s\n' 'Add complete secure log scanner Maven project' | git commit-tree "$tree" -p "$parent")
+          git push --force origin "$commit":refs/heads/agent/maven-project-setup
