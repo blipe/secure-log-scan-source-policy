@@ -1,0 +1,75 @@
+package securelogscan;
+
+import jdk.internal.org.objectweb.asm.ClassReader;
+import jdk.internal.org.objectweb.asm.Handle;
+import jdk.internal.org.objectweb.asm.Opcodes;
+import jdk.internal.org.objectweb.asm.Type;
+import jdk.internal.org.objectweb.asm.tree.*;
+import jdk.internal.org.objectweb.asm.tree.analysis.*;
+
+import java.io.*;
+import java.net.URI;
+import java.time.LocalDate;
+import java.time.format.DateTimeParseException;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.*;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
+import java.util.*;
+import java.util.jar.*;
+
+/**
+ * JDK-only bytecode scanner for @secure.Secure sources reaching log/print or diagnostic-context sinks.
+ *
+ * Values have four user-facing outcomes: UNTRACKED, UNSAFE, POSSIBLE, and SANITIZED.
+ * Tracked state is propagated through direct, render, and deep-render channels.
+ * @secure.Sanitize is an explicit trust boundary for a method return value.
+ *
+ * Compile/run with the --add-exports flags shown in README or use build.sh/run.sh.
+ */
+public final class SecureLogScan {
+    private SecureLogScan() {}
+
+    static final int ASM = Opcodes.ASM9;
+    static final String DEFAULT_SECURE_ANNOTATION_DESC = "Lsecure/Secure;";
+    static final String DEFAULT_SANITIZE_ANNOTATION_DESC = "Lsecure/Sanitize;";
+    static final String DEFAULT_SUPPRESSION_ANNOTATION_DESC = "Lsecure/SuppressSecureLog;";
+
+    public static void main(String[] args) throws Exception {
+        Config cfg = Config.parse(args);
+        if (cfg.help || cfg.roots.isEmpty()) {
+            Config.printHelp();
+            System.exit(cfg.roots.isEmpty() && !cfg.help ? 2 : 0);
+        }
+
+        ScanModel model = new ScanModel(cfg);
+        model.loadConfiguredInputs();
+        model.collectSecureFields();
+        model.loadMethodModels();
+        model.loadBaseline();
+        model.analyzeToFixpoint();
+        model.writeBaselineIfRequested();
+        model.printReport();
+        if ((cfg.failOnFinding || cfg.failOnNew) && model.hasFailingFinding()) System.exit(1);
+    }
+
+    enum ArtifactRole { APPLICATION, DEPENDENCY, JDK_RUNTIME }
+    enum DuplicateClassPolicy { FAIL, FIRST }
+    enum DependencyFindingsPolicy { REPORT, FAIL, IGNORE }
+    enum FindingScope { APPLICATION, CROSS_BOUNDARY, DEPENDENCY_INTERNAL, ANALYSIS }
+
+    static final class Config {
+        final List<Path> roots = new ArrayList<>();
+        final List<Path> classpathRoots = new ArrayList<>();
+        final List<Path> modulePathRoots = new ArrayList<>();
+        final List<String> jdkModules = new ArrayList<>();
+        final Set<String> annotationDescs = new LinkedHashSet<>();
+        final Set<String> sanitizeAnnotationDescs = new LinkedHashSet<>();
+        final Set<String> suppressionAnnotationDescs = new LinkedHashSet<>();
+        final List<Path> modelFiles = new ArrayList<>();
+        Path baselineFile;
+        Path writeBaselineFile;
+        boolean json;
+        boolean sarif;
+        Path sarifOutput;
+        boolean failOnFinding;
