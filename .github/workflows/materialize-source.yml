@@ -1,0 +1,64 @@
+name: Materialize verified source tree
+
+on:
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  materialize-verify-commit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Check out import branch
+        uses: actions/checkout@v4
+        with:
+          ref: agent/source-import-final
+          fetch-depth: 0
+
+      - name: Reconstruct and verify payload
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat .transfer/chunk.* | tr -d '\n' | base64 --decode > /tmp/source-tree.tar.xz
+          echo '22bc225880b245d7cf9760718ab07a0717e40a265f49ab152a13cb620d3b2083  /tmp/source-tree.tar.xz' | sha256sum --check
+          rm -rf /tmp/source-tree
+          mkdir -p /tmp/source-tree
+          tar -xJf /tmp/source-tree.tar.xz -C /tmp/source-tree
+          test "$(find /tmp/source-tree -type f | wc -l)" -eq 99
+          test "$(wc -l < /tmp/source-tree/src/main/java/securelogscan/SecureLogScan.java)" -eq 4605
+
+      - name: Materialize source files
+        shell: bash
+        run: |
+          set -euo pipefail
+          find . -mindepth 1 -maxdepth 1 ! -name .git ! -name .github -exec rm -rf {} +
+          cp -a /tmp/source-tree/. .
+          chmod +x build.sh run.sh test.sh test-policy.sh
+          test ! -e .transfer
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+          cache: maven
+
+      - name: Verify Maven project
+        run: mvn --batch-mode --no-transfer-progress --errors clean verify
+
+      - name: Commit ordinary source files
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          tree=$(git write-tree)
+          parent=$(git rev-parse origin/main)
+          commit=$(printf '%s\n' 'Add secure log scanner Maven project' | git commit-tree "$tree" -p "$parent")
+          git push --force origin "$commit":refs/heads/agent/source-import-final
