@@ -1,0 +1,117 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+  <modelVersion>4.0.0</modelVersion>
+
+  <groupId>io.github.blipe</groupId>
+  <artifactId>secure-log-scan-source-policy</artifactId>
+  <version>12.0.0-SNAPSHOT</version>
+  <packaging>jar</packaging>
+
+  <name>Secure Log Scan Source Policy</name>
+  <description>JDK-only bytecode analysis for secure values reaching logs, diagnostic context, exceptions, and asynchronous output.</description>
+  <url>https://github.com/blipe/secure-log-scan-source-policy</url>
+
+  <properties>
+    <maven.compiler.source>21</maven.compiler.source>
+    <maven.compiler.target>21</maven.compiler.target>
+    <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+    <project.reporting.outputEncoding>UTF-8</project.reporting.outputEncoding>
+  </properties>
+
+  <scm>
+    <connection>scm:git:https://github.com/blipe/secure-log-scan-source-policy.git</connection>
+    <developerConnection>scm:git:ssh://git@github.com/blipe/secure-log-scan-source-policy.git</developerConnection>
+    <url>https://github.com/blipe/secure-log-scan-source-policy</url>
+    <tag>HEAD</tag>
+  </scm>
+
+  <developers>
+    <developer>
+      <id>blipe</id>
+      <name>Jason Weinstein</name>
+      <url>https://github.com/blipe</url>
+    </developer>
+  </developers>
+
+  <build>
+    <plugins>
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-enforcer-plugin</artifactId>
+        <version>3.5.0</version>
+        <executions>
+          <execution>
+            <id>require-build-toolchain</id>
+            <goals><goal>enforce</goal></goals>
+            <configuration>
+              <rules>
+                <requireJavaVersion><version>[21,)</version></requireJavaVersion>
+                <requireMavenVersion><version>[3.9,)</version></requireMavenVersion>
+              </rules>
+            </configuration>
+          </execution>
+        </executions>
+      </plugin>
+
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-compiler-plugin</artifactId>
+        <version>3.14.0</version>
+        <configuration>
+          <showWarnings>true</showWarnings>
+          <compilerArgs>
+            <arg>-Xlint:all</arg>
+            <arg>-Werror</arg>
+            <arg>--add-exports</arg><arg>java.base/jdk.internal.org.objectweb.asm=ALL-UNNAMED</arg>
+            <arg>--add-exports</arg><arg>java.base/jdk.internal.org.objectweb.asm.tree=ALL-UNNAMED</arg>
+            <arg>--add-exports</arg><arg>java.base/jdk.internal.org.objectweb.asm.tree.analysis=ALL-UNNAMED</arg>
+          </compilerArgs>
+        </configuration>
+      </plugin>
+
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-jar-plugin</artifactId>
+        <version>3.4.2</version>
+        <configuration>
+          <archive>
+            <manifest><mainClass>securelogscan.SecureLogScan</mainClass></manifest>
+            <manifestEntries>
+              <Automatic-Module-Name>secure.log.scan</Automatic-Module-Name>
+              <Implementation-Title>${project.name}</Implementation-Title>
+              <Implementation-Version>${project.version}</Implementation-Version>
+            </manifestEntries>
+          </archive>
+        </configuration>
+      </plugin>
+
+      <plugin>
+        <groupId>org.codehaus.mojo</groupId>
+        <artifactId>exec-maven-plugin</artifactId>
+        <version>3.5.0</version>
+        <executions>
+          <execution>
+            <id>comprehensive-bytecode-regression</id>
+            <phase>integration-test</phase>
+            <goals><goal>exec</goal></goals>
+            <configuration>
+              <executable>bash</executable>
+              <arguments><argument>${project.basedir}/test.sh</argument></arguments>
+            </configuration>
+          </execution>
+          <execution>
+            <id>source-policy-regression</id>
+            <phase>integration-test</phase>
+            <goals><goal>exec</goal></goals>
+            <configuration>
+              <executable>bash</executable>
+              <arguments><argument>${project.basedir}/test-policy.sh</argument></arguments>
+            </configuration>
+          </execution>
+        </executions>
+      </plugin>
+    </plugins>
+  </build>
+</project>

@@ -1,0 +1,6 @@
+async.AsyncCases.safeExecutorCallbackIgnoresCapture(Ljava/util/concurrent/Executor;)V
+async.AsyncCases.safeFluentSupplier()V
+async.AsyncCases.safeThreadNeverStarted()V
+async.AsyncCases.safeUnknownCallbackHasNoSink(Lexternal/Registry;)V
+async.AsyncCases.safeUnusedCapturedLambda()V
+async.AsyncCases.safeUnusedDirectFieldLambda()V

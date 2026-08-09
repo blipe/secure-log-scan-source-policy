@@ -1,0 +1,5 @@
+matrix.expressions.ExpressionCases.unknownTransformationIsConservative()V
+matrix.types.ConstantInliningCases.crossClassPrimitiveConstant()V
+matrix.types.ConstantInliningCases.crossClassStringConstant()V
+matrix.types.TypeStructureCases.multidimensionalArray()V
+matrix.types.TypeStructureCases.staticFinalField()V
