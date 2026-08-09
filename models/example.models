@@ -1,0 +1,9 @@
+# Format: owner::name(JVM-descriptor)
+# Values are receiver, arg0, arg1, or allArgs. Modes are direct, render, or deep.
+
+sink LOG_OUTPUT com.acme.Audit::write(Ljava/lang/Object;)V values=arg0 mode=deep
+sink CONTEXT_CAPTURE com.acme.Context::put(Ljava/lang/String;Ljava/lang/Object;)V values=arg1 mode=deep
+renderer com.acme.Json::serialize(Ljava/lang/Object;)Ljava/lang/String; values=arg0 mode=deep
+callback com.acme.Dispatcher::submit(Ljava/lang/Object;Ljava/util/function/Consumer;)V target=arg1 invoke=accept(Ljava/lang/Object;)V values=arg0
+mutation com.acme.ExternalBag::add(Ljava/lang/Object;)V target=receiver values=arg0 mode=deep
+sanitizer com.acme.Redaction::mask(Ljava/lang/String;)Ljava/lang/String; description="Log-safe mask" justification="SEC-1421"

@@ -1,0 +1,6 @@
+sanitize.SanitizeCases.branchMergeBecomesUnsafe(Z)V
+sanitize.SanitizeCases.directUnsafe()V
+sanitize.SanitizeCases.ordinaryMethodIsUnsafe()V
+sanitize.SanitizeCases.sanitizerMayNotLeakInput()V
+sanitize.SanitizeCases.separateOriginsRemainSeparate()V
+sanitize.SanitizeCases.unsafeDominatesMixedValue()V
