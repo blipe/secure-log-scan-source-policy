@@ -1,0 +1,11 @@
+# Exact external method models. Owner may use dots or JVM slashes.
+sink LOG_OUTPUT models.ExternalApis::audit(Ljava/lang/Object;)V values=arg0 mode=deep
+sink CONTEXT_CAPTURE models.ExternalApis::context(Ljava/lang/String;Ljava/lang/Object;)V values=arg1 mode=deep
+sink LOG_OUTPUT models.ExternalApis::directOnly(Ljava/lang/Object;)V values=arg0 mode=direct
+renderer models.ExternalApis::serialize(Ljava/lang/Object;)Ljava/lang/String; values=arg0 mode=deep
+callback models.ExternalApis::dispatch(Ljava/lang/Runnable;)V target=arg0 invoke=run()V
+callback models.ExternalApis::consume(Ljava/lang/Object;Ljava/util/function/Consumer;)V target=arg1 invoke=accept(Ljava/lang/Object;)V values=arg0
+callback models.ExternalApis::transform(Ljava/lang/Object;Ljava/util/function/Function;)Ljava/lang/Object; target=arg1 invoke=apply(Ljava/lang/Object;)Ljava/lang/Object; values=arg0
+mutation models.ExternalApis::fill(Lmodels/ExternalApis$Box;Ljava/lang/Object;)V target=arg0 values=arg1 mode=deep
+mutation models.ExternalApis$Box::addExternal(Ljava/lang/Object;)V target=receiver values=arg0 mode=deep
+sanitizer models.ExternalApis::mask(Ljava/lang/String;)Ljava/lang/String; description="External masking boundary" justification="MODEL-SEC-7"
