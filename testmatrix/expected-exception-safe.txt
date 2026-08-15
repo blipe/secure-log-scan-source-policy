@@ -1,0 +1,5 @@
+exceptions.ExceptionGraphCases.completedFutureValueIsNotFailure(Lexceptions/ExceptionGraphCases$Bean;)V
+exceptions.ExceptionGraphCases.hiddenFieldIsNotRendered(Lexceptions/ExceptionGraphCases$Bean;)V
+exceptions.ExceptionGraphCases.messageOnlyHasNoCause(Lexceptions/ExceptionGraphCases$Bean;)V
+exceptions.ExceptionGraphCases.untrackedException()V
+exceptions.ExceptionGraphCases.unusedFailureObject(Lexceptions/ExceptionGraphCases$Bean;)V

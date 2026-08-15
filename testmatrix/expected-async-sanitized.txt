@@ -1,0 +1,5 @@
+async.AsyncCases.sanitizedAcrossAsync(Ljava/util/concurrent/Executor;)V
+async.AsyncCases.sanitizedCompletableChain()V
+async.AsyncCases.sanitizedFluentSupplier()V
+async.AsyncCases.sanitizedFluentSupplierThroughHelper()V
+async.AsyncCases.unknownSanitizedCallbackEscape(Lexternal/Registry;)V

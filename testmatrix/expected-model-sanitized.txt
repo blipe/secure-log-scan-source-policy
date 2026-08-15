@@ -1,0 +1,4 @@
+models.MethodModelCases.configuredSanitizedCallbackReturn()V
+models.MethodModelCases.configuredSanitizer()V
+models.MethodModelCases.configuredSanitizerMethodReference()V
+models.MethodModelCases.sanitizedConfiguredContext()V

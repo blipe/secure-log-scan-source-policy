@@ -1,0 +1,2 @@
+async.AsyncCases.unknownCallbackEscape(Lexternal/Registry;)V
+async.AsyncCases.unknownSupplierEscape(Lexternal/Registry;)V

@@ -1,0 +1,3 @@
+exceptions.ExceptionGraphCases.sanitizedFailedFuture(Lexceptions/ExceptionGraphCases$Bean;)V
+exceptions.ExceptionGraphCases.sanitizedMessage(Lexceptions/ExceptionGraphCases$Bean;)V
+exceptions.ExceptionGraphCases.sanitizedSuppressed(Lexceptions/ExceptionGraphCases$Bean;)V

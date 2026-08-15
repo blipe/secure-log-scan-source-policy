@@ -1,0 +1,15 @@
+sanitize.SanitizeCases.arrayPreservesSanitized()V
+sanitize.SanitizeCases.fieldPreservesSanitized()V
+sanitize.SanitizeCases.helperPreservesSanitized()V
+sanitize.SanitizeCases.lambdaPreservesSanitized()V
+sanitize.SanitizeCases.loggerPreservesSanitized()V
+sanitize.SanitizeCases.loggerSupplierPreservesSanitized()V
+sanitize.SanitizeCases.methodReferencePreservesSanitized()V
+sanitize.SanitizeCases.objectRenderingPreservesSanitized()V
+sanitize.SanitizeCases.objectSanitizer()V
+sanitize.SanitizeCases.optionalCallbackPreservesSanitized()V
+sanitize.SanitizeCases.recordRenderingPreservesSanitized()V
+sanitize.SanitizeCases.sanitizerMayNotLeakInput()V
+sanitize.SanitizeCases.separateOriginsRemainSeparate()V
+sanitize.SanitizeCases.simpleSanitized()V
+sanitize.SanitizeCases.stringConcatPreservesSanitized()V

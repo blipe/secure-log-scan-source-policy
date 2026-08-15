@@ -1,0 +1,6 @@
+context.MdcCases.differentOriginsRemainSeparate()V
+context.MdcCases.sanitizedContextMap()V
+context.MdcCases.sanitizedMdcPut()V
+context.MdcCases.sanitizedMethodReference()V
+context.MdcCases.sanitizedThreadContextStack()V
+context.MdcCases.sanitizedThroughHelper()V
